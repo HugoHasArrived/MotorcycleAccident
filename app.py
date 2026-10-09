@@ -1,21 +1,34 @@
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from threading import Lock
+import os
 import time
+import hmac
 
 app = Flask(__name__)
 lock = Lock()
+
+# Set DEVICE_TOKEN in Render's environment variables before
+# using the bridge outside a school/demo environment.
+DEVICE_TOKEN = os.environ.get(
+    "DEVICE_TOKEN", "bikeguard-demo-token"
+)
 
 state = {
     "status": "SAFE",
     "tilt": "NORMAL",
     "impact": "NONE",
     "countdown_start": None,
+    "countdown_value": 0,
     "alert": False,
-    "last_event": "System initialized",
+    "last_event": "Waiting for Arduino connection",
+    "last_event_time": time.time(),
+    "device_last_seen": None,
+    "last_serial": "",
     "gps": None,
     "contacts": []
 }
+
 
 PAGE = r"""
 <!DOCTYPE html>
@@ -35,6 +48,7 @@ PAGE = r"""
   --green: #34d399;
   --red: #fb7185;
   --blue: #60a5fa;
+  --yellow: #fbbf24;
 }
 * { box-sizing: border-box; }
 body {
@@ -49,7 +63,7 @@ header {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 20px max(5%, calc((100% - 1180px)/2));
+  padding: 20px max(4%, calc((100% - 1180px)/2));
   border-bottom: 1px solid var(--line);
   background: #09111de8;
 }
@@ -61,11 +75,9 @@ header {
   border-radius: 999px;
   padding: 8px 12px;
   font-size: 12px;
-  color: var(--green);
-  white-space: nowrap;
+  color: var(--yellow);
 }
 main { max-width: 1180px; width: 92%; margin: 28px auto; }
-.welcome { margin-bottom: 22px; }
 h1 { font-size: clamp(26px, 4vw, 38px); margin: 0 0 8px; }
 p { color: var(--muted); line-height: 1.6; }
 .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
@@ -82,7 +94,7 @@ p { color: var(--muted); line-height: 1.6; }
 .indicator {
   height: 82px; width: 82px; border-radius: 50%;
   margin: 0 auto 18px; background: #064e3b;
-  border: 8px solid #34d399;
+  border: 8px solid var(--green);
   box-shadow: 0 0 32px #34d39944;
 }
 .indicator.danger {
@@ -102,7 +114,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .secondary { background: #26374c; color: var(--text); }
 .value { font-size: 23px; font-weight: 800; overflow-wrap: anywhere; }
 .ok { color: var(--green); }
-.warn { color: #fbbf24; }
+.warn { color: var(--yellow); }
 .bad { color: var(--red); }
 .small { font-size: 12px; color: var(--muted); margin-top: 8px; }
 .wide { grid-column: span 3; }
@@ -114,10 +126,9 @@ input {
 }
 footer { text-align: center; color: var(--muted); padding: 28px 15px; font-size: 12px; }
 @media(max-width:760px) {
-  header { align-items: flex-start; }
+  header { align-items: flex-start; flex-wrap: wrap; }
   .grid { grid-template-columns: 1fr; }
   .hero, .wide { grid-column: span 1; }
-  .pill { font-size: 10px; }
 }
 </style>
 </head>
@@ -127,82 +138,85 @@ footer { text-align: center; color: var(--muted); padding: 28px 15px; font-size:
     <div class="brand">BIKE<span>GUARD</span></div>
     <div class="tagline">SMART RIDER SAFETY SYSTEM</div>
   </div>
-  <div class="pill" id="connection">● DEMO MODE</div>
+  <div class="pill" id="connection">● CHECKING CONNECTION</div>
 </header>
 
 <main>
-  <div class="welcome">
-    <h1>Safety Dashboard</h1>
-    <p>Monitor your prototype, test the accident countdown, and manage emergency contacts.</p>
-  </div>
+  <h1>Safety Dashboard</h1>
+  <p>Monitor your BikeGuard prototype and its latest sensor events.</p>
 
   <div class="grid">
     <section class="panel hero">
       <div class="indicator" id="indicator"></div>
       <div class="label">CURRENT SYSTEM STATUS</div>
-      <div class="big-status" id="status">SYSTEM SAFE</div>
-      <div class="sub" id="message">No simulated accident detected.</div>
+      <div class="big-status" id="status">WAITING FOR DEVICE</div>
+      <div class="sub" id="message">Waiting for Arduino messages.</div>
       <div class="countdown" id="countdown"></div>
       <div class="actions">
-        <button class="danger-btn" id="test" onclick="testAccident()">TEST ACCIDENT</button>
-        <button class="primary" id="cancel" onclick="cancelAccident()" hidden>CANCEL ALERT</button>
-        <button class="secondary" id="reset" onclick="resetSystem()" hidden>RESET SYSTEM</button>
+        <button class="danger-btn" onclick="sendAction('/api/test')">
+          TEST WEBSITE DEMO
+        </button>
+        <button class="primary" id="cancel" onclick="sendAction('/api/cancel')" hidden>
+          CANCEL DEMO
+        </button>
+        <button class="secondary" id="reset" onclick="sendAction('/api/reset')">
+          RESET WEBSITE
+        </button>
       </div>
-      <div class="small">Website demonstration only — not a real emergency service.</div>
+      <div class="small">
+        Demo controls do not cancel the physical Arduino countdown.
+        No SMS is sent by this website.
+      </div>
     </section>
 
     <section class="panel">
-      <div class="label">TILT SENSOR</div>
+      <div class="label">TILT SWITCH</div>
       <div class="value ok" id="tilt">NORMAL</div>
-      <div class="small">Live hardware connection not configured</div>
+      <div class="small">Reported by the Arduino prototype</div>
     </section>
 
     <section class="panel">
-      <div class="label">IMPACT DETECTION</div>
+      <div class="label">IMPACT STATUS</div>
       <div class="value ok" id="impact">NONE</div>
-      <div class="small">Impact sensor not configured</div>
+      <div class="small">The current tilt switch does not measure impact force.</div>
     </section>
 
     <section class="panel">
       <div class="label">GPS LOCATION</div>
       <div class="value warn">NOT CONNECTED</div>
-      <div class="small">No GPS coordinates received</div>
+      <div class="small">A GPS module is required for real coordinates.</div>
     </section>
 
     <section class="panel">
       <div class="label">GSM / SMS</div>
       <div class="value warn">NOT CONNECTED</div>
-      <div class="small">No SMS messages can be sent yet</div>
+      <div class="small">A compatible GSM module is required to send SMS.</div>
     </section>
 
     <section class="panel">
       <div class="label">ARDUINO CONNECTION</div>
-      <div class="value warn">NOT CONNECTED</div>
-      <div class="small">Render cannot directly access your USB-connected UNO.</div>
-    </section>
-
-    <section class="panel wide">
-      <div class="row">
-        <div>
-          <div class="label">EMERGENCY CONTACTS</div>
-          <div class="value" style="font-size:18px">Your safety circle</div>
-        </div>
-      </div>
-      <p>Enter a contact name for this browser demo. Contact details are not saved to an account.</p>
-      <form onsubmit="addContact(event)">
-        <label for="contactName">Contact name</label>
-        <input id="contactName" maxlength="60" placeholder="e.g. Mom" required>
-        <label for="contactPhone">Phone number (optional demo field)</label>
-        <input id="contactPhone" maxlength="25" placeholder="e.g. 09XX XXX XXXX">
-        <button class="secondary" type="submit">ADD CONTACT</button>
-      </form>
-      <div id="contacts" class="small">No contacts added.</div>
+      <div class="value warn" id="device">NOT CONNECTED</div>
+      <div class="small" id="deviceTime">Waiting for serial data</div>
     </section>
 
     <section class="panel wide">
       <div class="label">LATEST EVENT</div>
-      <div id="event">System initialized</div>
+      <div id="event">Waiting for Arduino connection</div>
       <div class="small" id="eventTime"></div>
+      <div class="small" id="serialLine"></div>
+    </section>
+
+    <section class="panel wide">
+      <div class="label">EMERGENCY CONTACTS — BROWSER DEMO</div>
+      <p>Contacts are kept only in this browser and are not sent to emergency services.</p>
+      <form onsubmit="addContact(event)">
+        <label for="contactName">Contact name</label>
+        <input id="contactName" maxlength="60" placeholder="e.g. Mom" required>
+        <label for="contactPhone">Phone number (optional)</label>
+        <input id="contactPhone" maxlength="25" placeholder="e.g. 09XX XXX XXXX">
+        <button class="secondary" type="submit">ADD CONTACT</button>
+      </form>
+      <div id="contacts" class="small">No contacts added.</div>
     </section>
   </div>
 </main>
@@ -210,89 +224,74 @@ footer { text-align: center; color: var(--muted); padding: 28px 15px; font-size:
 <footer>BIKEGUARD • SCHOOL ROBOTICS & ENGINEERING PROTOTYPE</footer>
 
 <script>
-let timer = null;
-let remaining = 10;
+const $ = id => document.getElementById(id);
 let contacts = [];
 
-const $ = id => document.getElementById(id);
-
-async function api(path) {
-  const response = await fetch(path, {method: "POST"});
-  if (!response.ok) throw new Error("Server request failed");
-  return response.json();
+async function sendAction(path) {
+  try {
+    const response = await fetch(path, {method: "POST"});
+    if (!response.ok) throw new Error("Request failed");
+    await refreshStatus();
+  } catch (error) {
+    $("message").textContent = "Could not contact the website server.";
+  }
 }
 
-function showEvent(text) {
-  $("event").textContent = text;
-  $("eventTime").textContent = new Date().toLocaleString();
-}
+async function refreshStatus() {
+  try {
+    const response = await fetch("/api/status", {cache: "no-store"});
+    if (!response.ok) throw new Error("Status request failed");
+    const s = await response.json();
 
-function testAccident() {
-  if (timer !== null) return;
+    const connected = s.device_connected;
+    $("connection").textContent = connected
+      ? "● ARDUINO CONNECTED" : "● ARDUINO DISCONNECTED";
+    $("connection").style.color = connected ? "#34d399" : "#fbbf24";
+    $("device").textContent = connected ? "CONNECTED" : "NOT CONNECTED";
+    $("device").className = "value " + (connected ? "ok" : "warn");
 
-  remaining = 10;
-  $("indicator").classList.add("danger");
-  $("status").textContent = "POSSIBLE ACCIDENT";
-  $("message").textContent = "Demo countdown active. Press cancel if safe.";
-  $("tilt").textContent = "ABNORMAL";
-  $("tilt").className = "value bad";
-  $("impact").textContent = "DEMO DETECTED";
-  $("impact").className = "value bad";
-  $("test").disabled = true;
-  $("cancel").hidden = false;
-  $("reset").hidden = true;
-  $("countdown").textContent = remaining;
-  showEvent("Simulated accident detected");
+    $("deviceTime").textContent = connected
+      ? "Receiving recent serial messages"
+      : "Keep the Python bridge running on the USB-connected computer";
 
-  timer = setInterval(() => {
-    remaining--;
-    $("countdown").textContent = remaining;
+    $("status").textContent = {
+      SAFE: "SYSTEM SAFE",
+      ACCIDENT: "POSSIBLE ACCIDENT",
+      COUNTDOWN: "COUNTDOWN ACTIVE",
+      CANCELLED: "ALERT CANCELLED",
+      ALERT: "ALERT TRIGGERED"
+    }[s.status] || s.status;
 
-    if (remaining <= 0) {
-      clearInterval(timer);
-      timer = null;
-      $("status").textContent = "ALERT TRIGGERED";
-      $("message").textContent = "Demo alert activated. No SMS was sent.";
-      $("countdown").textContent = "!";
-      $("cancel").hidden = true;
-      $("reset").hidden = false;
-      showEvent("Demo emergency alert triggered");
-    }
-  }, 1000);
-}
+    const danger = ["ACCIDENT", "COUNTDOWN", "ALERT"].includes(s.status);
+    $("indicator").classList.toggle("danger", danger);
+    $("message").textContent = {
+      SAFE: connected ? "Arduino reports normal status." : "Waiting for Arduino messages.",
+      ACCIDENT: "Possible accident reported by the device.",
+      COUNTDOWN: "Countdown active. Use the physical cancel button if safe.",
+      CANCELLED: "Countdown cancelled.",
+      ALERT: "Arduino reports that its countdown expired."
+    }[s.status] || "Waiting for device status.";
 
-function cancelAccident() {
-  if (timer === null) return;
-  clearInterval(timer);
-  timer = null;
-  $("indicator").classList.remove("danger");
-  $("status").textContent = "ALERT CANCELLED";
-  $("message").textContent = "Demo cancelled by the user.";
-  $("countdown").textContent = "";
-  $("tilt").textContent = "NORMAL";
-  $("tilt").className = "value ok";
-  $("impact").textContent = "NONE";
-  $("impact").className = "value ok";
-  $("cancel").hidden = true;
-  $("reset").hidden = false;
-  showEvent("Demo alert cancelled");
-}
+    $("tilt").textContent = s.tilt;
+    $("tilt").className = "value " + (s.tilt === "NORMAL" ? "ok" : "bad");
+    $("impact").textContent = s.impact;
+    $("impact").className = "value " + (s.impact === "NONE" ? "ok" : "bad");
 
-function resetSystem() {
-  if (timer !== null) clearInterval(timer);
-  timer = null;
-  $("indicator").classList.remove("danger");
-  $("status").textContent = "SYSTEM SAFE";
-  $("message").textContent = "No simulated accident detected.";
-  $("countdown").textContent = "";
-  $("tilt").textContent = "NORMAL";
-  $("tilt").className = "value ok";
-  $("impact").textContent = "NONE";
-  $("impact").className = "value ok";
-  $("test").disabled = false;
-  $("cancel").hidden = true;
-  $("reset").hidden = true;
-  showEvent("System reset in demo");
+    $("countdown").textContent =
+      s.status === "COUNTDOWN" ? s.countdown : "";
+
+    $("cancel").hidden = s.status !== "ACCIDENT" && s.status !== "COUNTDOWN";
+    $("event").textContent = s.last_event || "No event yet";
+    $("eventTime").textContent = s.last_event_time
+      ? "Updated: " + new Date(s.last_event_time * 1000).toLocaleString()
+      : "";
+    $("serialLine").textContent = s.last_serial
+      ? "Last Arduino message: " + s.last_serial : "";
+  } catch (error) {
+    $("connection").textContent = "● WEBSITE SERVER ERROR";
+    $("connection").style.color = "#fb7185";
+    $("message").textContent = "Unable to load status. Refresh the page later.";
+  }
 }
 
 function addContact(event) {
@@ -307,8 +306,7 @@ function addContact(event) {
   contacts.forEach(contact => {
     const line = document.createElement("div");
     line.textContent = contact.phone
-      ? contact.name + " — " + contact.phone
-      : contact.name;
+      ? contact.name + " — " + contact.phone : contact.name;
     $("contacts").appendChild(line);
   });
 
@@ -316,40 +314,166 @@ function addContact(event) {
   $("contactPhone").value = "";
 }
 
-$("connection").textContent = "● WEBSITE ONLINE";
+refreshStatus();
+setInterval(refreshStatus, 1000);
 </script>
 </body>
 </html>
 """
 
+
 @app.get("/")
 def home():
     return render_template_string(PAGE)
 
+
 @app.get("/api/status")
 def get_status():
+    now = time.time()
+
     with lock:
         data = dict(state)
-        start = data["countdown_start"]
-        if start is not None:
-            data["countdown"] = max(0, 10 - int(time.time() - start))
+        last_seen = data["device_last_seen"]
+        data["device_connected"] = (
+            last_seen is not None and now - last_seen < 15
+        )
+
+        if data["status"] == "COUNTDOWN" and data["countdown_start"] is not None:
+            elapsed = int(now - data["countdown_start"])
+            data["countdown"] = max(0, data["countdown_value"] - elapsed)
+
+            # Auto-complete website demo countdowns.
+            if data["countdown"] == 0 and not data["device_connected"]:
+                state.update(
+                    status="ALERT",
+                    alert=True,
+                    countdown_start=None,
+                    last_event="Website demo countdown expired",
+                    last_event_time=now
+                )
+                data.update(
+                    status="ALERT",
+                    alert=True,
+                    countdown=0,
+                    countdown_start=None,
+                    last_event="Website demo countdown expired",
+                    last_event_time=now
+                )
         else:
-            data["countdown"] = 0
+            data["countdown"] = data["countdown_value"]
+
         data["countdown_start"] = None
+
     return jsonify(data)
+
+
+@app.post("/api/device")
+def receive_device():
+    supplied_token = request.headers.get("X-Device-Token", "")
+
+    if not hmac.compare_digest(supplied_token, DEVICE_TOKEN):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    message = str(body.get("message", "")).strip()
+
+    if not message or len(message) > 100:
+        return jsonify({"ok": False, "error": "Invalid message"}), 400
+
+    now = time.time()
+
+    with lock:
+        state["device_last_seen"] = now
+        state["last_serial"] = message
+
+        if message == "BIKEGUARD_CONNECTED":
+            state["last_event"] = "Arduino connected to Python bridge"
+
+        elif message == "BG:SAFE":
+            if state["status"] not in ("COUNTDOWN", "ALERT"):
+                state.update(
+                    status="SAFE",
+                    tilt="NORMAL",
+                    impact="NONE",
+                    countdown_start=None,
+                    countdown_value=0,
+                    alert=False,
+                    last_event="Arduino reports normal status"
+                )
+
+        elif message == "BG:ACCIDENT":
+            state.update(
+                status="ACCIDENT",
+                tilt="ABNORMAL",
+                impact="TILT DETECTED",
+                countdown_start=None,
+                countdown_value=0,
+                alert=False,
+                last_event="Arduino detected abnormal tilt"
+            )
+
+        elif message.startswith("BG:COUNTDOWN:"):
+            try:
+                seconds = int(message.split(":")[-1])
+                seconds = max(0, min(60, seconds))
+            except ValueError:
+                return jsonify({"ok": False, "error": "Invalid countdown"}), 400
+
+            state.update(
+                status="COUNTDOWN",
+                tilt="ABNORMAL",
+                impact="TILT DETECTED",
+                countdown_value=seconds,
+                countdown_start=now,
+                alert=False,
+                last_event=f"Arduino countdown: {seconds} seconds"
+            )
+
+        elif message == "BG:CANCELLED":
+            state.update(
+                status="CANCELLED",
+                tilt="NORMAL",
+                impact="NONE",
+                countdown_start=None,
+                countdown_value=0,
+                alert=False,
+                last_event="Countdown cancelled using the Arduino button"
+            )
+
+        elif message == "BG:ALERT":
+            state.update(
+                status="ALERT",
+                tilt="ABNORMAL",
+                impact="TILT DETECTED",
+                countdown_start=None,
+                countdown_value=0,
+                alert=True,
+                last_event="Arduino countdown expired; alert triggered"
+            )
+
+        else:
+            state["last_event"] = "Arduino message received"
+
+        state["last_event_time"] = now
+
+    return jsonify({"ok": True})
+
 
 @app.post("/api/test")
 def test():
     with lock:
         state.update(
-            status="ACCIDENT",
+            status="COUNTDOWN",
             tilt="ABNORMAL",
-            impact="DETECTED",
+            impact="DEMO ONLY",
             countdown_start=time.time(),
+            countdown_value=10,
             alert=False,
-            last_event="Test accident started"
+            last_event="Website demo countdown started",
+            last_event_time=time.time()
         )
-        return jsonify({"ok": True, "message": "Demo countdown started"})
+    return jsonify({"ok": True})
+
 
 @app.post("/api/cancel")
 def cancel():
@@ -359,10 +483,13 @@ def cancel():
             tilt="NORMAL",
             impact="NONE",
             countdown_start=None,
+            countdown_value=0,
             alert=False,
-            last_event="Demo alert cancelled"
+            last_event="Website demo cancelled",
+            last_event_time=time.time()
         )
-        return jsonify({"ok": True})
+    return jsonify({"ok": True})
+
 
 @app.post("/api/reset")
 def reset():
@@ -372,10 +499,13 @@ def reset():
             tilt="NORMAL",
             impact="NONE",
             countdown_start=None,
+            countdown_value=0,
             alert=False,
-            last_event="System reset"
+            last_event="Website status reset",
+            last_event_time=time.time()
         )
-        return jsonify({"ok": True})
+    return jsonify({"ok": True})
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
