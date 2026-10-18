@@ -10,7 +10,7 @@ lock = Lock()
 
 # TEST TOKEN: must exactly match bridge.py's DEVICE_TOKEN.
 # This is hardcoded for the requested test; rotate it before public use.
-DEVICE_TOKEN = Hugo@091413
+DEVICE_TOKEN = "Hugo@091413"
 
 state = {
     "status": "SAFE",
