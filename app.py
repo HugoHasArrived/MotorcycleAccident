@@ -8,11 +8,9 @@ import hmac
 app = Flask(__name__)
 lock = Lock()
 
-# Set DEVICE_TOKEN in Render's environment variables before
-# using the bridge outside a school/demo environment.
-DEVICE_TOKEN = os.environ.get(
-    "DEVICE_TOKEN", "bikeguard-demo-token"
-)
+# TEST TOKEN: must exactly match bridge.py's DEVICE_TOKEN.
+# This is hardcoded for the requested test; rotate it before public use.
+DEVICE_TOKEN = "Hugo@091413"
 
 state = {
     "status": "SAFE",
