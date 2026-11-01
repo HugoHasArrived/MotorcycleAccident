@@ -1,4 +1,3 @@
-
 import os
 from datetime import datetime, timezone
 
@@ -58,7 +57,6 @@ def status():
 @app.post('/api/device')
 def device():
     global _memory_latest
-
     body = request.get_json(silent=True) or {}
     message = body.get('message')
 
