@@ -1,9 +1,23 @@
+import hashlib
+
 import os
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from pymongo import MongoClient, DESCENDING
 
 app = Flask(__name__)
+
+@app.get('/api/debug-auth')
+def debug_auth():
+    token = os.environ.get('DEVICE_TOKEN', '')
+    return jsonify({
+        'configured': bool(token),
+        'length': len(token),
+        'fingerprint': hashlib.sha256(
+            token.encode()
+        ).hexdigest()[:12]
+    })
+    
 DEVICE_TOKEN = os.environ.get('DEVICE_TOKEN', '')
 MONGODB_URI = os.environ.get('MONGODB_URI', '')
 MONGODB_DB = os.environ.get('MONGODB_DB', 'bikeguard')
